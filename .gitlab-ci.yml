@@ -1,0 +1,113 @@
+image: "<docker-hub-address>/image-scanner:3.17.0-v5.1.0"
+
+.common_rules:
+  only:
+    changes:
+      - sources
+    refs:
+      - master
+  except:
+    refs:
+      - merge_requests
+  tags:
+   - <runner-name>
+
+.notary_settings: # Notary server is deployed on separated machine at test env.
+  before_script:
+    - echo "$NOTARY_SERVER_IP notary-server" >> /etc/hosts
+    - export DOCKER_CONTENT_TRUST_SERVER=$NOTARY_SERVER_URL
+
+stages:
+  - sync
+  - analyze
+  - decision
+  - publish
+  - finalyze
+
+sync:sources: # Pulls target public image(s) to move in quarantine.
+  stage: sync
+  script:
+    - python3 py/sync_images.py
+  extends: .common_rules
+
+quarantine:compliance_scan: # Scans for security auditing and hardening compliances.
+  stage: analyze
+  script:
+    - python3 py/scan_compliance.py
+    - /bin/mkdir -p compliance-reports
+    - /bin/mv $COMPLIANCE_REPORT_FOLDER/*.pdf compliance-reports/
+  artifacts:
+    name: "$CI_JOB_NAME-compliance-report"
+    paths:
+      - ./compliance-reports/*.pdf
+    expire_in: 10 yrs
+  extends: .common_rules
+
+quarantine:malware_scan: # Scans to find possible rootkits, backdoors and local exploits.
+  stage: analyze
+  script:
+    - python3 py/scan_malware.py
+    - /bin/mkdir -p malware-reports
+    - /bin/mv $MALWARE_REPORT_FOLDER/*.pdf malware-reports/
+  artifacts:
+    name: "$CI_JOB_NAME-malware-report"
+    paths:
+      - ./malware-reports/*.pdf
+    expire_in: 10 yrs
+  extends: .common_rules
+
+quarantine:package_scan: # Scans to find possible vulnerabilities on library and packages.
+  stage: analyze
+  script:
+    - python3 py/scan_packages.py
+  extends: .common_rules
+
+promote:sign: # Tags scanned image and wait before sign process.
+  stage: decision
+  script:
+    - python3 py/sign_images.py
+  dependencies: []
+  when: manual
+  allow_failure: false
+  extends: .common_rules
+
+promote:publish: # Signs and pushes scanned image into the docker registry.
+  stage: publish
+  script:
+    - eval "$(ssh-agent)" && echo "$KEYSYNC_SSH_PRIVATE_KEY" | ssh-add -
+    - python3 py/push_images.py
+  dependencies: []
+  when: on_success
+  allow_failure: false
+  extends:
+    - .common_rules
+    - .notary_settings
+
+1/3 list:currentsigned: # Lists scanned and signed image in current pipeline.
+  stage: finalyze
+  script:
+    - python3 py/check_signed.py
+  dependencies: []
+  when: on_success
+  allow_failure: True
+  extends:
+    - .common_rules
+    - .notary_settings
+
+2/3 cleanup:result: # Removes running containers, and local image from quarantine.
+  stage: finalyze
+  script:
+    -  python3 py/clean_quarantine.py
+  dependencies: []
+  when: on_success
+  allow_failure: True
+  extends: .common_rules
+
+3/3 list:allsigned: # Lists all scanned and signed images in past times.
+  stage: finalyze
+  script:
+    -  python3 py/list_signedimages.py
+  dependencies: []
+  when: on_success
+  allow_failure: True
+  extends: .common_rules
